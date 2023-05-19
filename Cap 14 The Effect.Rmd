@@ -1,0 +1,159 @@
+#install.packages('contrib.url')
+#library(contrib.url)
+
+install.packages('modelsummary')
+install.packages('causaldata')
+
+# Or dev version (currently identical):
+# If necessary: install.packages('remotes')
+install.packages('remotes')
+
+remotes::install_github('NickCH-K/causaldata/R/')
+
+
+
+
+#1 
+install.packages('Matching')
+install.packages('tidyverse')
+
+
+library(Matching); library(tidyverse)
+br <- causaldata::black_politicians
+
+# Outcome
+Y <- br %>%
+  pull(responded)
+# Treatment
+D <- br %>%
+  pull(leg_black)
+# Matching variables
+# Note select() is also in the Matching package, so we specify dplyr
+X <- br %>%
+  dplyr::select(medianhhincom, blackpercent, leg_democrat) %>%
+  as.matrix()
+
+# Weight = 2, oddly, denotes Mahalanobis distance
+M <- Match(Y, D, X, Weight = 2, caliper = 1)
+
+# See treatment effect estimate
+summary(M)
+
+# Get matched data for use elsewhere. Note that this approach will 
+# duplicate each observation for each time it was matched
+matched_treated <- tibble(id = M$index.treated,
+                          weight = M$weights)
+matched_control <- tibble(id = M$index.control,
+                          weight = M$weights)
+matched_sets <- bind_rows(matched_treated,
+                          matched_control) 
+# Simplify to one row per observation
+matched_sets <- matched_sets %>%
+  group_by(id) %>%
+  summarize(weight = sum(weight))
+# And bring back to data
+matched_br <- br %>%
+  mutate(id = row_number()) %>%
+  left_join(matched_sets, by = 'id')
+
+# To be used like this! The standard errors here are wrong
+lm(responded~leg_black, data = matched_br, weights = weight)
+
+
+
+
+#2
+
+install.packages('cem')
+
+library(cem); library(tidyverse)
+br <- causaldata::black_politicians
+
+# Limit to just the relevant variables and omit missings
+brcem <- br %>%
+  select(responded, leg_black, medianhhincom, 
+         blackpercent, leg_democrat) %>%
+  na.omit() %>%
+  as.data.frame() # Must be a data.frame, not a tibble
+
+# Create breaks. Use quantiles to create quantile cuts or manually for 
+# evenly spaced (You can also skip this and let it do it automatically,
+# although you MUST do it yourself for binary variables). Be sure
+# to include the "edges" (max and min values). So! Six bins each:
+inc_bins <- quantile(brcem$medianhhincom, (0:6)/6)
+
+create_even_breaks <- function(x, n) {
+  minx <- min(x)
+  maxx <- max(x)
+  
+  return(minx + ((0:n)/n)*(maxx-minx))
+}
+
+bp_bins <- create_even_breaks(brcem$blackpercent, 6)
+
+# For binary, we specifically need two even bins
+ld_bins <- create_even_breaks(brcem$leg_democrat,2)
+
+# Make a list of bins
+allbreaks <- list('medianhhincom' = inc_bins,
+                  'blackpercent' = bp_bins,
+                  'leg_democrat' = ld_bins)
+
+# Match, being sure not to match on the outcome
+# Note the baseline.group is the *treated* group
+c <- cem(treatment = 'leg_black', data = brcem,
+         baseline.group =  '1',
+         drop = 'responded',
+         cutpoints = allbreaks,
+         keep.all = TRUE)
+
+# Get weights for other purposes
+brcem <- brcem %>%
+  mutate(cem_weight = c$w)
+lm(responded~leg_black, data = brcem, weights = cem_weight)
+
+# Or use their estimation function att. Note there are many options 
+# for these functions including logit or machine-learing treatment 
+# estimation. Read the docs!
+att(c, responded ~ leg_black, data = brcem)
+
+
+
+
+#3
+
+install.packages('ebal')
+install.packages('modelsummary')
+
+library(ebal); library(tidyverse); library(modelsummary)
+br <- causaldata::black_politicians
+
+# Outcome
+Y <- br %>%
+  pull(responded)
+# Treatment
+D <- br %>%
+  pull(leg_black)
+# Matching variables
+X <- br %>%
+  select(medianhhincom, blackpercent, leg_democrat) %>%
+  # Add square terms to match variances if we like
+  mutate(incsq = medianhhincom^2,
+         bpsq = blackpercent^2) %>%
+  as.matrix()
+
+eb <- ebalance(D, X)
+
+# Get weights for usage elsewhere
+# Noting that this contains only control weights
+br_treat <- br %>%
+  filter(leg_black == 1) %>%
+  mutate(weights = 1)
+br_con <- br %>%
+  filter(leg_black == 0) %>%
+  mutate(weights = eb$w)
+br <- bind_rows(br_treat, br_con)
+
+m <- lm(responded ~ leg_black, data = br, weights = weights)
+msummary(m, stars = c('*' = .1, '**' = .05, '***' = .01))
+
