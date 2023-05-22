@@ -13,10 +13,6 @@ install.packages('remotes')
 remotes::install_github('NickCH-K/causaldata/R/')
 
 
-
-
-
-
 #1 
 install.packages('Matching')
 install.packages('tidyverse')
@@ -160,4 +156,191 @@ br <- bind_rows(br_treat, br_con)
 
 m <- lm(responded ~ leg_black, data = br, weights = weights)
 msummary(m, stars = c('*' = .1, '**' = .05, '***' = .01))
+
+
+#4
+
+install.packages("causalweight")
+
+library(causalweight); library(tidyverse)
+br <- causaldata::black_politicians
+
+# We can estimate our own propensity score
+m <- glm(leg_black ~ medianhhincom + blackpercent + leg_democrat,
+         data = br, family = binomial(link = 'logit'))
+# Get predicted values
+br <- br %>%
+  mutate(ps = predict(m, type = 'response'))
+# "Trim" control observations outside of 
+# treated propensity score range
+# (we'll discuss this later in Common Support)
+minps <- br %>%
+  filter(leg_black == 1) %>%
+  pull(ps) %>%
+  min(na.rm = TRUE)
+maxps <- br %>%
+  filter(leg_black == 1) %>%
+  pull(ps) %>%
+  max(na.rm = TRUE)
+br <- br %>%
+  filter(ps >= minps & ps <= maxps)
+
+# Create IPW weights
+br <- br %>%
+  mutate(ipw = case_when(
+    leg_black == 1 ~ 1/ps,
+    leg_black == 0 ~ 1/(1-ps)))
+
+# And use to weight regressions (The standard errors will be wrong
+# here unless we bootstrap the whole process - See the code examples 
+# from the doubly robust estimation section or the simulation chapter)
+lm(responded ~ leg_black, data = br, weights = ipw)
+
+# Or we can use the causalweight package!
+# First, pull out our variables
+# Outcome
+Y <- br %>%
+  pull(responded)
+# Treatment
+D <- br %>%
+  pull(leg_black)
+# Matching variables
+X <- br %>%
+  select(medianhhincom, blackpercent, leg_democrat) %>%
+  as.matrix()
+
+# Note by default this produces average treatment effect,
+# not average treatment on the treated, and trims propensity 
+# scores based on extreme values rather than matching treated range
+IPW <- treatweight(Y, D, X, trim = .001, logit = TRUE)
+
+# Estimate and SE
+IPW$effect
+IPW$se
+
+
+
+#5 
+library(tidyverse)
+br <- causaldata::black_politicians
+
+# We can estimate our own propensity score
+m <- glm(leg_black ~ medianhhincom + blackpercent + leg_democrat,
+         data = br, family = binomial(link = 'logit'))
+# Get predicted values
+br <- br %>%
+  mutate(ps = predict(m, type = 'response'))
+
+# Create IPW weights
+br <- br %>%
+  mutate(ipw = case_when(
+    leg_black == 1 ~ 1/ps,
+    leg_black == 0 ~ 1/(1-ps)))
+
+# Density plots for raw data
+ggplot(br, aes(x = medianhhincom, color = factor(leg_black))) + 
+  geom_density()
+
+# And using our matching weights
+ggplot(br, aes(x = medianhhincom, color = factor(leg_black),
+               weight = ipw)) + geom_density()
+
+
+
+#6
+library(cem); library(tidyverse); library(modelsummary)
+br <- causaldata::black_politicians
+
+# This copies the CEM code from the CEM section
+# See that section's code for comments and notes
+
+# Limit to just the relevant variables and omit missings
+# (of which there are none in this data)
+brcem <- br %>%
+  select(responded, leg_black, medianhhincom, 
+         blackpercent, leg_democrat) %>%
+  na.omit() %>%
+  as.data.frame() 
+
+# Create breaks
+inc_bins <- quantile(brcem$medianhhincom, (0:6)/6)
+
+create_even_breaks <- function(x, n) {
+  minx <- min(x)
+  maxx <- max(x)
+  return(minx + ((0:n)/n)*(maxx-minx))
+}
+
+bp_bins <- create_even_breaks(brcem$blackpercent, 6)
+ld_bins <- create_even_breaks(brcem$leg_democrat,2)
+
+allbreaks <- list('medianhhincom' = inc_bins,
+                  'blackpercent' = bp_bins,
+                  'leg_democrat' = ld_bins)
+
+c <- cem(treatment = 'leg_black', data = brcem,
+         baseline.group =  '1', drop = 'responded',
+         cutpoints = allbreaks, keep.all = TRUE)
+
+# Get weights for other purposes.  Note this exact code only 
+# works because we didn't have to drop any NAs. If we did, 
+# lining things up would be trickier
+br <- br %>%
+  mutate(cem_weight = c$w)
+m1 <- lm(responded~leg_black*treat_out + nonblacknonwhite +
+           black_medianhh + white_medianhh + statessquireindex + 
+           totalpop + urbanpercent, data = br, weights = cem_weight)
+msummary(m1, stars = c('*' = .1, '**' = .05, '***' = .01))
+
+
+#7
+
+install.packages("boot")
+library(boot); library(tidyverse)
+br <- causaldata::black_politicians
+
+# Function to do IPW estimation with regression adjustment
+ipwra <- function(br, index = 1:nrow(br)) {
+  # Apply bootstrap index
+  br <- br %>% slice(index)
+  
+  # estimate and predict propensity score
+  m <- glm(leg_black ~ medianhhincom + blackpercent + leg_democrat,
+           data = br, family = binomial(link = 'logit'))
+  br <- br %>%
+    mutate(ps = predict(m, type = 'response'))
+  
+  # Trim control observations outside of treated PS range
+  minps <- br %>%
+    filter(leg_black == 1) %>%
+    pull(ps) %>%
+    min(na.rm = TRUE)
+  maxps <- br %>%
+    filter(leg_black == 1) %>%
+    pull(ps) %>%
+    max(na.rm = TRUE)
+  br <- br %>%
+    filter(ps >= minps & ps <= maxps)
+  
+  # Create IPW weights
+  br <- br %>%
+    mutate(ipw = case_when(
+      leg_black == 1 ~ 1/ps,
+      leg_black == 0 ~ 1/(1-ps)))
+  
+  # Estimate difference
+  w_means <- br %>% 
+    group_by(leg_black) %>%
+    summarize(m = weighted.mean(responded, w = ipw)) %>%
+    arrange(leg_black)
+  
+  return(w_means$m[2] - w_means$m[1])
+}
+
+
+b <- boot(br, ipwra, R = 200)
+# See estimate and standard error
+b
+
+
 
